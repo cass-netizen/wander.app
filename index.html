@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Wander — Audio History Guide</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1115;
+    color: #eee;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 14px 16px;
+    background: #171a21;
+    border-bottom: 1px solid #262a33;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 18px;
+  }
+  header p {
+    margin: 4px 0 0;
+    font-size: 12px;
+    color: #8a90a0;
+  }
+  #map {
+    flex: 1;
+    min-height: 220px;
+  }
+  #status {
+    padding: 8px 16px;
+    font-size: 13px;
+    color: #8a90a0;
+    background: #12141a;
+  }
+  #list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px 24px;
+    background: #0f1115;
+  }
+  .place {
+    background: #171a21;
+    border: 1px solid #262a33;
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+  .place h2 {
+    margin: 0 0 4px;
+    font-size: 15px;
+  }
+  .place .dist {
+    font-size: 11px;
+    color: #6f7686;
+    margin-bottom: 8px;
+  }
+  .place p {
+    margin: 0 0 10px;
+    font-size: 13px;
+    line-height: 1.4;
+    color: #c7cad1;
+  }
+  .buttons {
+    display: flex;
+    gap: 8px;
+  }
+  button {
+    border: none;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    background: #3d6bff;
+    color: white;
+  }
+  button.stop {
+    background: #2a2e38;
+    color: #c7cad1;
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  #locateBtn {
+    position: fixed;
+    top: 70px;
+    right: 16px;
+    z-index: 500;
+    background: #3d6bff;
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    padding: 0;
+    font-size: 18px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🎧 Wander</h1>
+  <p>Point your phone, find what's nearby, hear its history.</p>
+</header>
+
+<div id="map"></div>
+<button id="locateBtn" title="Re-center on me">📍</button>
+<div id="status">Waiting for location…</div>
+<div id="list"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const statusEl = document.getElementById('status');
+const listEl = document.getElementById('list');
+let map, userMarker;
+let currentUtterance = null;
+
+// --- Map setup ---
+function initMap(lat, lon) {
+  map = L.map('map').setView([lat, lon], 16);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  userMarker = L.circleMarker([lat, lon], {
+    radius: 8, color: '#3d6bff', fillColor: '#3d6bff', fillOpacity: 1
+  }).addTo(map).bindPopup('You are here');
+}
+
+// --- Distance helper (meters) ---
+function distMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// --- Wikipedia: find nearby geotagged pages ---
+async function findNearbyPlaces(lat, lon) {
+  const url = `https://en.wikipedia.org/w/api.php?action=query&list=geosearch&gscoord=${lat}|${lon}&gsradius=2000&gslimit=15&format=json&origin=*`;
+  const res = await fetch(url);
+  const data = await res.json();
+  return data.query.geosearch;
+}
+
+// --- Wikipedia: get a plain-text summary for a page ---
+async function getSummary(title) {
+  const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.extract || null;
+}
+
+function speak(text, btn, allButtons) {
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.rate = 0.95;
+  currentUtterance = utter;
+  allButtons.forEach(b => b.textContent = '▶ Listen');
+  btn.textContent = '⏸ Playing…';
+  utter.onend = () => { btn.textContent = '▶ Listen'; };
+  window.speechSynthesis.speak(utter);
+}
+
+async function renderPlaces(lat, lon) {
+  statusEl.textContent = 'Searching nearby history…';
+  let places;
+  try {
+    places = await findNearbyPlaces(lat, lon);
+  } catch (e) {
+    statusEl.textContent = 'Could not reach Wikipedia. Check your connection.';
+    return;
+  }
+
+  if (!places.length) {
+    statusEl.textContent = 'Nothing notable found within 2km. Try moving around.';
+    listEl.innerHTML = '';
+    return;
+  }
+
+  statusEl.textContent = `Found ${places.length} nearby places.`;
+  listEl.innerHTML = '';
+  const allButtons = [];
+
+  for (const place of places) {
+    const d = Math.round(distMeters(lat, lon, place.lat, place.lon));
+
+    const marker = L.marker([place.lat, place.lon]).addTo(map).bindPopup(place.title);
+
+    const card = document.createElement('div');
+    card.className = 'place';
+    card.innerHTML = `
+      <h2>${place.title}</h2>
+      <div class="dist">${d} m away</div>
+      <p class="summary">Loading history…</p>
+      <div class="buttons">
+        <button class="listenBtn">▶ Listen</button>
+        <button class="stop stopBtn">■ Stop</button>
+      </div>
+    `;
+    listEl.appendChild(card);
+
+    const summaryEl = card.querySelector('.summary');
+    const listenBtn = card.querySelector('.listenBtn');
+    const stopBtn = card.querySelector('.stopBtn');
+    allButtons.push(listenBtn);
+
+    marker.on('click', () => card.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+
+    getSummary(place.title).then(text => {
+      if (text) {
+        summaryEl.textContent = text;
+        listenBtn.disabled = false;
+      } else {
+        summaryEl.textContent = 'No summary available for this place.';
+        listenBtn.disabled = true;
+      }
+    });
+    listenBtn.disabled = true;
+
+    listenBtn.addEventListener('click', () => {
+      speak(summaryEl.textContent, listenBtn, allButtons);
+    });
+    stopBtn.addEventListener('click', () => {
+      window.speechSynthesis.cancel();
+      allButtons.forEach(b => b.textContent = '▶ Listen');
+    });
+  }
+}
+
+function handlePosition(pos) {
+  const { latitude, longitude } = pos.coords;
+  if (!map) {
+    initMap(latitude, longitude);
+  } else {
+    userMarker.setLatLng([latitude, longitude]);
+    map.setView([latitude, longitude]);
+  }
+  renderPlaces(latitude, longitude);
+}
+
+function handleError(err) {
+  statusEl.textContent = 'Location error: ' + err.message + ' (this app needs HTTPS or localhost, and location permission).';
+}
+
+function locate() {
+  if (!navigator.geolocation) {
+    statusEl.textContent = 'Geolocation not supported on this device.';
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(handlePosition, handleError, {
+    enableHighAccuracy: true, timeout: 10000
+  });
+}
+
+document.getElementById('locateBtn').addEventListener('click', locate);
+locate();
+</script>
+</body>
+</html>
